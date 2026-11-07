@@ -1,0 +1,79 @@
+# OpenBusinessERP - Coolify deployment, from the published all-in-one image.
+#
+# Self-contained (Coolify deploys a single compose file): the published
+# all-in-one image serving API + compiled frontend on 8080, plus PostgreSQL.
+# Nothing is built on the host, which keeps the first run off the memory-hungry
+# frontend/wheel build.
+#
+# Routing: Coolify/Traefik terminates TLS and routes the public host name to the
+# `app` service's port 8080 (set via the resource's "Docker Compose Domains",
+# keyed to `app`). Services therefore `expose` rather than publish to the host,
+# so nothing contends with the proxy for port 80/443.
+#
+# Required env (set in the Coolify resource, not here):
+#   POSTGRES_PASSWORD, JWT_SECRET, ALLOWED_ORIGINS (the public https origin).
+# Optional: OE_IMAGE_TAG (defaults to latest), POSTGRES_USER, POSTGRES_DB.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-oe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-openestimate}
+    volumes:
+      - pg_data_v2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-oe} -d ${POSTGRES_DB:-openestimate}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    image: ghcr.io/datadrivenconstruction/openbusinesserp:${OE_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Connection parts. Compose has no urlencode, so the password is passed as
+      # a part and the image's entrypoint composes + percent-encodes it; this is
+      # the path that survives a password containing "@".
+      OE_DB_HOST: postgres
+      OE_DB_PORT: "5432"
+      OE_DB_USER: ${POSTGRES_USER:-oe}
+      OE_DB_NAME: ${POSTGRES_DB:-openestimate}
+      OE_DB_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      # Finished URLs as well, for any published image built before the image
+      # learned to read the parts above (it would otherwise exit with
+      # "DATABASE_URL is not set"). An image that has the parts ignores these.
+      # Safe here because the generated password is URL-safe (no "@").
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-oe}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openestimate}
+      DATABASE_SYNC_URL: postgresql://${POSTGRES_USER:-oe}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-openestimate}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      SERVE_FRONTEND: "true"
+      # Must list the public origin the browser uses, or API calls after login
+      # are refused by the browser (blank screen, clean server log).
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8080}
+      # Pin the data dir at the persistent volume so BIM geometry / vector store
+      # survive a container recreate.
+      OE_DATA_DIR: /data
+      APP_ENV: production
+      APP_DEBUG: "false"
+      VECTOR_BACKEND: lancedb
+    expose:
+      - "8080"
+    volumes:
+      - app_data_v2:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  pg_data_v2:
+  app_data_v2:
